@@ -12,6 +12,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from scipy.signal import find_peaks
+from scipy.stats import skew, kurtosis
 
 st.set_page_config(page_title="Anomaly Detection Dashboard", page_icon="🛡️", layout="wide")
 st.title("🛡️ Anomaly Detection & Classification")
@@ -55,8 +57,8 @@ c4.metric("Duplicate rows", f"{int(df.duplicated().sum()):,}")
 with st.expander("Preview dataset", expanded=False):
     st.dataframe(df.head(30), use_container_width=True)
 
-tab_eda, tab_models, tab_predict, tab_data = st.tabs(
-    ["📊 Exploratory Analysis", "🤖 Model Comparison", "🔍 Predictions", "🗃️ Data Quality"]
+tab_eda, tab_models, tab_predict, tab_raw, tab_data = st.tabs(
+    ["📊 Dashboard / EDA", "🤖 Model Comparison", "✍️ Single Segment & Batch", "📡 Raw Signal", "🗃️ Data Quality"]
 )
 
 # Target values, convert safely for charts/models
@@ -195,10 +197,59 @@ with tab_models:
     plt.close(fig)
 
 with tab_predict:
+    st.subheader("Manual Signal Prediction")
+    st.write("Enter the feature values for one new signal. The app uses the selected trained model to predict whether it is Normal or Anomaly.")
+    model_choice = st.selectbox("Prediction model", list(trained_models.keys()), index=list(trained_models.keys()).index(best_model_name), key="manual_model_choice")
+
+    with st.form("manual_signal_form"):
+        st.markdown("#### Signal features")
+        manual_values = {}
+        feature_cols = list(X.columns)
+        feature_layout = st.columns(2)
+        for i, col in enumerate(feature_cols):
+            with feature_layout[i % 2]:
+                if col in num_cols:
+                    median_value = pd.to_numeric(X_train[col], errors="coerce").median()
+                    default_value = float(median_value) if pd.notna(median_value) else 0.0
+                    manual_values[col] = st.number_input(
+                        col, value=default_value, key=f"manual_{col}", help=f"Enter a value for {col}"
+                    )
+                else:
+                    options = X_train[col].dropna().astype(str).unique().tolist()
+                    options = sorted(options)
+                    if len(options) <= 50 and options:
+                        manual_values[col] = st.selectbox(col, options, key=f"manual_{col}")
+                    else:
+                        common_value = X_train[col].dropna().astype(str).mode()
+                        default_text = str(common_value.iloc[0]) if not common_value.empty else ""
+                        manual_values[col] = st.text_input(col, value=default_text, key=f"manual_{col}")
+        submitted_manual = st.form_submit_button("🔍 Predict Signal", use_container_width=True)
+
+    if submitted_manual:
+        try:
+            manual_input = pd.DataFrame([manual_values], columns=feature_cols)
+            manual_prediction = trained_models[model_choice].predict(manual_input)[0]
+            if hasattr(trained_models[model_choice], "predict_proba"):
+                probabilities = trained_models[model_choice].predict_proba(manual_input)[0]
+                classes = trained_models[model_choice].named_steps["model"].classes_
+                confidence = float(probabilities[list(classes).index(manual_prediction)])
+            else:
+                confidence = None
+            if int(manual_prediction) == 1:
+                st.error("🚨 Prediction: ANOMALY")
+            else:
+                st.success("✅ Prediction: NORMAL")
+            if confidence is not None:
+                st.metric("Model confidence for predicted class", f"{confidence:.1%}")
+            with st.expander("Review submitted feature values"):
+                st.dataframe(manual_input, use_container_width=True)
+        except Exception as e:
+            st.error(f"Manual prediction error: {e}")
+
+    st.divider()
     st.subheader("Batch Prediction")
     st.write("Upload a CSV containing the feature columns used in the training dataset. The target column `anomaly` is optional.")
     pred_file = st.file_uploader("Upload records for prediction", type=["csv"], key="prediction_csv")
-    model_choice = st.selectbox("Prediction model", list(trained_models.keys()), index=list(trained_models.keys()).index(best_model_name))
     if pred_file:
         try:
             pred_df = pd.read_csv(pred_file)
@@ -207,7 +258,6 @@ with tab_predict:
             if missing:
                 st.error("Missing feature columns: " + ", ".join(missing))
             else:
-                # Remove optional label/split columns if present, retain feature columns in expected order
                 pred_input = pred_df[required].copy()
                 predicted = trained_models[model_choice].predict(pred_input)
                 output = pred_df.copy()
@@ -218,7 +268,129 @@ with tab_predict:
         except Exception as e:
             st.error(f"Prediction error: {e}")
     else:
-        st.info("Upload a CSV above to generate predictions.")
+        st.info("Upload a CSV above to generate batch predictions.")
+
+with tab_raw:
+    st.subheader("Predict from a raw signal")
+    st.warning(
+        "Raw-signal features are calculated in this app using NumPy and SciPy. "
+        "Because the original feature-engineering script used to create the training dataset was not available, "
+        "peak-based features may differ from the original pipeline. Treat raw-signal predictions as indicative."
+    )
+
+    raw_left, raw_right = st.columns(2)
+    with raw_left:
+        raw_channel = st.selectbox(
+            "Channel", sorted(X_train["channel"].dropna().astype(str).unique()) if "channel" in X_train.columns else ["CADC0872"],
+            key="raw_channel"
+        )
+    with raw_right:
+        raw_sampling = st.number_input("Sampling interval", min_value=0.000001, value=1.0, step=1.0, key="raw_sampling")
+
+    use_demo = st.checkbox("Use a synthetic demo signal (not real telemetry)", value=True)
+    upload_col, paste_col = st.columns(2)
+    with upload_col:
+        raw_file = st.file_uploader("Upload a CSV with one column of readings", type=["csv"], key="raw_signal_csv")
+    with paste_col:
+        pasted = st.text_area("Or paste readings (comma, space or newline separated)", placeholder="2.1e-06, 3.4e-06, 1.9e-06, ...", height=100)
+
+    def extract_raw_features(signal, sampling_interval):
+        x = np.asarray(signal, dtype=float)
+        x = x[np.isfinite(x)]
+        if len(x) < 5:
+            raise ValueError("Please provide at least 5 valid numeric readings.")
+        d1 = np.diff(x)
+        d2 = np.diff(d1) if len(d1) > 1 else np.array([0.0])
+        smooth10 = pd.Series(x).rolling(10, min_periods=1, center=True).mean().to_numpy()
+        smooth20 = pd.Series(x).rolling(20, min_periods=1, center=True).mean().to_numpy()
+        p, _ = find_peaks(x)
+        p10, _ = find_peaks(smooth10)
+        p20, _ = find_peaks(smooth20)
+        dp, _ = find_peaks(d1) if len(d1) > 2 else (np.array([]), {})
+        d2p, _ = find_peaks(d2) if len(d2) > 2 else (np.array([]), {})
+        duration = max((len(x) - 1) * float(sampling_interval), 1.0)
+        variance = float(np.var(x, ddof=1)) if len(x) > 1 else 0.0
+        features = {
+            "sampling": float(sampling_interval), "duration": duration, "len": len(x),
+            "mean": float(np.mean(x)), "var": variance,
+            "std": float(np.std(x, ddof=1)) if len(x) > 1 else 0.0,
+            "kurtosis": float(kurtosis(x, bias=True)) if np.std(x) > 0 else 0.0,
+            "skew": float(skew(x, bias=True)) if np.std(x) > 0 else 0.0,
+            "n_peaks": int(len(p)), "smooth10_n_peaks": int(len(p10)),
+            "smooth20_n_peaks": int(len(p20)), "diff_peaks": int(len(dp)),
+            "diff2_peaks": int(len(d2p)),
+            "diff_var": float(np.var(d1, ddof=1)) if len(d1) > 1 else 0.0,
+            "diff2_var": float(np.var(d2, ddof=1)) if len(d2) > 1 else 0.0,
+            "gaps_squared": float(duration), "len_weighted": float(len(x)),
+            "var_div_duration": float(variance / duration),
+            "var_div_len": float(variance / max(len(x), 1))
+        }
+        return features, x
+
+    signal = None
+    if raw_file is not None:
+        try:
+            raw_df = pd.read_csv(raw_file)
+            numeric_candidates = raw_df.select_dtypes(include=np.number)
+            if numeric_candidates.empty:
+                st.error("The uploaded CSV must contain at least one numeric readings column.")
+            else:
+                selected_reading_col = st.selectbox("Select readings column", numeric_candidates.columns.tolist())
+                signal = numeric_candidates[selected_reading_col].dropna().to_numpy(dtype=float)
+        except Exception as e:
+            st.error(f"Could not read signal CSV: {e}")
+    elif pasted.strip():
+        try:
+            signal = np.fromstring(pasted.replace(",", " ").replace(";", " "), sep=" ")
+        except Exception:
+            st.error("Could not parse the pasted readings. Use commas or spaces between numbers.")
+    elif use_demo:
+        t = np.linspace(0, 2 * np.pi, 200)
+        signal = 2.0e-5 * np.sin(t) + 2.0e-6 * np.sin(5 * t)
+
+    if signal is not None and len(signal) > 0:
+        try:
+            raw_features, clean_signal = extract_raw_features(signal, raw_sampling)
+            fig, ax = plt.subplots(figsize=(12, 3))
+            ax.plot(np.arange(len(clean_signal)) * raw_sampling, clean_signal, linewidth=1.2)
+            ax.set_xlabel("Time")
+            ax.set_ylabel("Signal amplitude")
+            ax.set_title("Signal preview")
+            ax.grid(alpha=0.2)
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+
+            if st.button("🔍 Predict raw signal", type="primary", key="predict_raw_signal"):
+                raw_row = {}
+                for col in X.columns:
+                    if col == "channel":
+                        raw_row[col] = raw_channel
+                    elif col in raw_features:
+                        raw_row[col] = raw_features[col]
+                    else:
+                        # Preserve compatibility with any additional training feature.
+                        med = pd.to_numeric(X_train[col], errors="coerce").median() if col in X_train.columns else 0
+                        raw_row[col] = float(med) if pd.notna(med) else 0.0
+                raw_input = pd.DataFrame([raw_row], columns=X.columns)
+                raw_pred = trained_models[best_model_name].predict(raw_input)[0]
+                probs = trained_models[best_model_name].predict_proba(raw_input)[0] if hasattr(trained_models[best_model_name], "predict_proba") else None
+                anomaly_prob = float(probs[list(trained_models[best_model_name].named_steps["model"].classes_).index(1)]) if probs is not None and 1 in trained_models[best_model_name].named_steps["model"].classes_ else None
+                st.divider()
+                if int(raw_pred) == 1:
+                    st.error("🚨 Satellite Anomaly Detected")
+                else:
+                    st.success("✅ Signal classified as Normal")
+                if anomaly_prob is not None:
+                    k1, k2 = st.columns(2)
+                    k1.metric("Anomaly probability", f"{anomaly_prob:.1%}")
+                    k2.metric("Normal probability", f"{1-anomaly_prob:.1%}")
+                    st.progress(min(max(anomaly_prob, 0.0), 1.0), text=f"Anomaly risk: {anomaly_prob:.1%}")
+                with st.expander("Extracted features"):
+                    st.dataframe(pd.DataFrame([raw_features]).T.rename(columns={0: "Value"}), use_container_width=True)
+        except Exception as e:
+            st.error(f"Raw signal processing error: {e}")
+    else:
+        st.info("Upload a one-column signal CSV, paste readings, or select the synthetic demo signal.")
 
 with tab_data:
     st.subheader("Data Quality")
